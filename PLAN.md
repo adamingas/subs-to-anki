@@ -1,0 +1,5 @@
+now let's create a plan on how to do this. first off let's output results as jsonl, one line per word translated. each word should include the normalised form, one example sentence, the translation (full, of all meanings) of the normalised_form
+
+For a first pass we should just use the qwen/qwen3.5-122b-a10b with reasoning effort "none" on around 25 words. Then check that this is producing good results.
+
+Then the next phase should be in selecting sentences. We should come up with a way to arrange the words to be learned, and the sentences, in such a way that there should only be one unknown word in each sentence, the one being learned by learner. this means putting the words with low freqeuny counts towards the end, and those with the highest at the beginning. Then, using the list of original_form words of the input (which the union of should be all the words in the corpus), and the sentences, we should be able to construct the order of words and sentences to be learned (one sentence per card) such that there is as few unknown words as you move through them as possible. We can come up with a loss function for this to optimize for it. 

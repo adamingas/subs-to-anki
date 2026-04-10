@@ -1,0 +1,111 @@
+{
+  "items": [
+    {
+      "card": {
+        "normalized_form": "σπίτι",
+        "english_translation": "home; house",
+        "sentence": {
+          "sentence_text": "Τώρα τα πράγματα είναι πιο ήσυχα στο σπίτι.",
+          "source_srt": "data/raw/Maestro.in.Blue.S01E08.Autoimmune.Diseases.1080p.NF.WEB-DL.DUAL.DDP5.1.H.264-FLUX.gre.1.srt"
+        },
+        "front": "σπίτι",
+        "back_html": "home; house<br><br>Τώρα τα πράγματα είναι πιο ήσυχα στο σπίτι.",
+        "source_candidate_lemmas": [
+          "σπίτι"
+        ],
+        "original_forms": [
+          "σπίτι"
+        ],
+        "occurrence_count": 14
+      },
+      "cache": {
+        "cache_hit": false,
+        "elapsed_ms": 1664.3090409925207,
+        "status": "completed",
+        "error_text": null
+      }
+    },
+    {
+      "card": {
+        "normalized_form": "άνθρωπος",
+        "english_translation": "human; person",
+        "sentence": {
+          "sentence_text": "Αλλάζει ο άνθρωπος;",
+          "source_srt": "data/raw/Maestro.in.Blue.S01E07.A.Rough.Guy.Is.Sinking.1080p.NF.WEB-DL.DUAL.DDP5.1.H.264-FLUX.gre.1.srt"
+        },
+        "front": "άνθρωπος",
+        "back_html": "human; person<br><br>Αλλάζει ο άνθρωπος;",
+        "source_candidate_lemmas": [
+          "άνθρωπος"
+        ],
+        "original_forms": [
+          "άνθρωποι",
+          "ανθρώπους",
+          "άνθρωπος",
+          "άνθρωπο"
+        ],
+        "occurrence_count": 13
+      },
+      "cache": {
+        "cache_hit": false,
+        "elapsed_ms": 3217.2409590275493,
+        "status": "completed",
+        "error_text": null
+      }
+    },
+    {
+      "card": {
+        "normalized_form": "ηρεμώ",
+        "english_translation": "calm down; relax",
+        "sentence": {
+          "sentence_text": "Είναι η γυναίκα σου έγκυος, τραβιέσαι με τη 18χρονη κόρη μου και μου ζητάς να ηρεμήσω;",
+          "source_srt": "data/raw/Maestro.in.Blue.S01E08.Autoimmune.Diseases.1080p.NF.WEB-DL.DUAL.DDP5.1.H.264-FLUX.gre.1.srt"
+        },
+        "front": "ηρεμώ",
+        "back_html": "calm down; relax<br><br>Είναι η γυναίκα σου έγκυος, τραβιέσαι με τη 18χρονη κόρη μου και μου ζητάς να ηρεμήσω;",
+        "source_candidate_lemmas": [
+          "ηρέμησε",
+          "ηρεμήσω"
+        ],
+        "original_forms": [
+          "ηρέμησε",
+          "Ηρέμησε",
+          "ηρεμήσω"
+        ],
+        "occurrence_count": 7
+      },
+      "cache": {
+        "cache_hit": false,
+        "elapsed_ms": 3187.304834020324,
+        "status": "completed",
+        "error_text": null
+      }
+    }
+  ],
+  "model": "google/gemma-4-31b-it",
+  "source_files": {
+    "review_results": "data/lemma_review_results.json",
+    "lemma_entries": "data/lemma_entries.jsonl"
+  },
+  "outputs": {
+    "json": "data/card_creator_results.json",
+    "tsv": "data/anki_cards.tsv",
+    "apkg": "data/anki_cards.apkg"
+  },
+  "settings": {
+    "temperature": 0.2,
+    "max_tokens": 256,
+    "concurrency": 10,
+    "thinking": false,
+    "deck_name": "Greek Lemmas",
+    "seed": 42,
+    "prompt_version": "card-translation-v1"
+  },
+  "summary": {
+    "candidate_count": 3,
+    "completed": 3,
+    "failed": 0,
+    "cache_hits": 0,
+    "missing_entry_candidates": []
+  }
+}
