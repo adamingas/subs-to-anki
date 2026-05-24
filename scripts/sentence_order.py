@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +26,8 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 
 DEFAULT_INPUT_PATH = Path("data/lemma_normalisation_preprocess.jsonl")
 DEFAULT_ENTRIES_INPUT_PATH = Path("data/lemma_entries.jsonl")
-DEFAULT_OUTPUT_PATH = Path("data/sentence_order.jsonl")
+DEFAULT_OUTPUT_PATH = Path("data/sentence_order.full.jsonl")
+DEFAULT_METRICS_DB_PATH = Path("data/sentence_order_metrics.sqlite3")
 SRT_TAG_PATTERN = re.compile(r"\{\\[^}]+\}")
 TOKEN_PATTERN = re.compile(r"[A-Za-zΑ-Ωα-ωΆ-ώΪΫϊϋΐΰ]+")
 GREEK_PATTERN = re.compile(r"[Α-Ωα-ωΆ-ώΪΫϊϋΐΰ]")
@@ -61,12 +65,21 @@ EntryIndex = dict[str, list[LemmaEntry]]
 
 
 @dataclass(frozen=True)
+class DependencyInfo:
+    form: str
+    normalized_form: str
+
+
+@dataclass(frozen=True)
 class SentenceAnalysis:
     sentence: SentenceContext | None
-    dependencies: tuple[str, ...]
+    dependencies: tuple[DependencyInfo, ...]
     external_unknown_forms: tuple[str, ...]
     token_count: int
     candidate_sentence_count: int
+
+
+FormMaps = tuple[dict[str, str], dict[str, str], dict[str, str]]
 
 
 def load_jsonl(path: Path, model: type[BaseModel]) -> list[BaseModel]:
@@ -88,6 +101,17 @@ def unique_strings(values: list[str]) -> list[str]:
         if value in seen:
             continue
         seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def unique_dependencies(values: list[DependencyInfo]) -> list[DependencyInfo]:
+    seen: set[str] = set()
+    unique: list[DependencyInfo] = []
+    for value in values:
+        if value.form in seen:
+            continue
+        seen.add(value.form)
         unique.append(value)
     return unique
 
@@ -164,19 +188,18 @@ def is_noisy_sentence(sentence_text: str) -> bool:
     return bool(re.search(r"\.{2,}|\d", text))
 
 
-def build_form_maps(rows: list[TranslationRow]) -> tuple[dict[str, str], dict[str, str]]:
-    exact_sets: dict[str, set[str]] = {}
-    casefold_sets: dict[str, set[str]] = {}
+def build_form_maps(rows: list[TranslationRow]) -> FormMaps:
+    exact_form_map: dict[str, str] = {}
+    casefold_form_map: dict[str, str] = {}
+    form_label_map: dict[str, str] = {}
     for row in rows:
         for form in row.original_forms:
-            exact_sets.setdefault(form, set()).add(row.normalized_form)
-            casefold_sets.setdefault(form.casefold(), set()).add(row.normalized_form)
-        exact_sets.setdefault(row.normalized_form, set()).add(row.normalized_form)
-        casefold_sets.setdefault(row.normalized_form.casefold(), set()).add(row.normalized_form)
-
-    exact = {form: next(iter(forms)) for form, forms in exact_sets.items() if len(forms) == 1}
-    casefold = {form: next(iter(forms)) for form, forms in casefold_sets.items() if len(forms) == 1}
-    return exact, casefold
+            if not form:
+                continue
+            exact_form_map.setdefault(form, form)
+            casefold_form_map.setdefault(form.casefold(), form)
+            form_label_map.setdefault(form, row.normalized_form)
+    return exact_form_map, casefold_form_map, form_label_map
 
 
 def map_token(token: str, exact_form_map: dict[str, str], casefold_form_map: dict[str, str]) -> str | None:
@@ -191,19 +214,24 @@ def analyze_sentence(
     sentence: SentenceContext,
     exact_form_map: dict[str, str],
     casefold_form_map: dict[str, str],
-) -> tuple[list[str], list[str], int]:
-    dependencies: list[str] = []
+    form_label_map: dict[str, str],
+) -> tuple[list[DependencyInfo], list[str], int]:
+    dependencies: list[DependencyInfo] = []
     external_unknown_forms: list[str] = []
-    for token in tokenize(sentence.sentence_text):
-        normalized = map_token(token, exact_form_map, casefold_form_map)
-        if normalized is None:
+    target_forms = set(row.original_forms)
+    target_casefold_forms = {form.casefold() for form in row.original_forms}
+    tokens = tokenize(sentence.sentence_text)
+    for token in tokens:
+        form = map_token(token, exact_form_map, casefold_form_map)
+        if form is None:
             if is_greek_token(token):
-                external_unknown_forms.append(token.lower())
+                external_unknown_forms.append(token.casefold())
             continue
-        if normalized != row.normalized_form:
-            dependencies.append(normalized)
+        if form in target_forms or form.casefold() in target_casefold_forms:
+            continue
+        dependencies.append(DependencyInfo(form=form, normalized_form=form_label_map.get(form, form)))
 
-    return unique_strings(dependencies), unique_strings(external_unknown_forms), len(tokenize(sentence.sentence_text))
+    return unique_dependencies(dependencies), unique_strings(external_unknown_forms), len(tokens)
 
 
 def collect_candidate_sentences(row: TranslationRow, entry_index: EntryIndex) -> list[SentenceContext]:
@@ -224,6 +252,7 @@ def build_sentence_analyses(
     entry_index: EntryIndex,
     exact_form_map: dict[str, str],
     casefold_form_map: dict[str, str],
+    form_label_map: dict[str, str],
 ) -> list[SentenceAnalysis]:
     candidates = collect_candidate_sentences(row, entry_index)
     if not candidates:
@@ -238,6 +267,7 @@ def build_sentence_analyses(
             sentence,
             exact_form_map,
             casefold_form_map,
+            form_label_map,
         )
         analyses.append(
             SentenceAnalysis(
@@ -260,13 +290,83 @@ def build_sentence_analyses(
     )
 
 
+def dependency_demand(analyses_by_row: list[list[SentenceAnalysis]]) -> Counter[str]:
+    demand: Counter[str] = Counter()
+    for analyses in analyses_by_row:
+        row_forms: set[str] = set()
+        for analysis in analyses:
+            row_forms.update(dependency.form for dependency in analysis.dependencies)
+        demand.update(row_forms)
+    return demand
+
+
+def zero_requirement_sets(analyses_by_row: list[list[SentenceAnalysis]]) -> list[list[frozenset[str]]]:
+    requirements_by_row: list[list[frozenset[str]]] = []
+    for analyses in analyses_by_row:
+        row_requirements: list[frozenset[str]] = []
+        seen: set[frozenset[str]] = set()
+        for analysis in analyses:
+            if analysis.sentence is None or analysis.external_unknown_forms:
+                continue
+            requirements = frozenset(dependency.form.casefold() for dependency in analysis.dependencies)
+            if requirements in seen:
+                continue
+            seen.add(requirements)
+            row_requirements.append(requirements)
+        requirements_by_row.append(sorted(row_requirements, key=lambda values: (len(values), sorted(values))))
+    return requirements_by_row
+
+
+def row_form_keys(row: TranslationRow) -> set[str]:
+    return {form.casefold() for form in row.original_forms}
+
+
+def row_can_be_zero(requirements_by_row: list[list[frozenset[str]]], input_index: int, known_keys: set[str]) -> bool:
+    return any(requirements <= known_keys for requirements in requirements_by_row[input_index])
+
+
+def closure_size_after_seed(
+    seed_index: int,
+    remaining: set[int],
+    known_keys: set[str],
+    requirements_by_row: list[list[frozenset[str]]],
+    row_form_key_sets: list[set[str]],
+) -> int:
+    simulated_known = set(known_keys)
+    simulated_known.update(row_form_key_sets[seed_index])
+    simulated_remaining = set(remaining)
+    simulated_remaining.remove(seed_index)
+    closure_size = 0
+    changed = True
+    while changed:
+        changed = False
+        for input_index in list(simulated_remaining):
+            if not row_can_be_zero(requirements_by_row, input_index, simulated_known):
+                continue
+            simulated_remaining.remove(input_index)
+            simulated_known.update(row_form_key_sets[input_index])
+            closure_size += 1
+            changed = True
+    return closure_size
+
+
+def known_form_set(row: TranslationRow) -> set[str]:
+    return set(row.original_forms) | {form.casefold() for form in row.original_forms}
+
+
+def is_known_form(form: str, known: set[str]) -> bool:
+    return form in known or form.casefold() in known
+
+
 def best_analysis_for_known(
     analyses: list[SentenceAnalysis],
     known: set[str],
-) -> tuple[SentenceAnalysis, list[str], tuple[int, int, int, str]]:
-    best: tuple[SentenceAnalysis, list[str], tuple[int, int, int, str]] | None = None
+) -> tuple[SentenceAnalysis, list[DependencyInfo], tuple[int, int, int, str]]:
+    best: tuple[SentenceAnalysis, list[DependencyInfo], tuple[int, int, int, str]] | None = None
     for analysis in analyses:
-        dependency_violations = [dependency for dependency in analysis.dependencies if dependency not in known]
+        dependency_violations = [
+            dependency for dependency in analysis.dependencies if not is_known_form(dependency.form, known)
+        ]
         if analysis.sentence is None:
             score = (999, 999, 999, "")
         else:
@@ -285,26 +385,83 @@ def best_analysis_for_known(
     return best
 
 
-def build_ordered_rows(rows: list[TranslationRow], analyses_by_row: list[list[SentenceAnalysis]]) -> list[dict[str, Any]]:
+def unlock_potential(row: TranslationRow, known: set[str], demand: Counter[str]) -> int:
+    return sum(demand[form] for form in row.original_forms if not is_known_form(form, known))
+
+
+def choice_sort_key(
+    algorithm: str,
+    score: tuple[int, int, int, str],
+    row: TranslationRow,
+    input_index: int,
+    known: set[str],
+    demand: Counter[str],
+) -> tuple[int, ...]:
+    total_unknown = score[0] + score[1]
+    unlock = unlock_potential(row, known, demand)
+    if algorithm == "greedy_unlock":
+        return (total_unknown, score[0], score[1], -unlock, score[2], -row.occurrence_count, input_index)
+    if algorithm == "greedy_frequency_unlock":
+        return (total_unknown, score[0], score[1], -row.occurrence_count, -unlock, score[2], input_index)
+    if algorithm == "greedy_unlock_frequency":
+        return (total_unknown, score[0], score[1], -unlock, -row.occurrence_count, score[2], input_index)
+    return (total_unknown, score[0], score[1], score[2], -row.occurrence_count, input_index)
+
+
+def build_ordered_rows(
+    rows: list[TranslationRow],
+    analyses_by_row: list[list[SentenceAnalysis]],
+    algorithm: str,
+) -> list[dict[str, Any]]:
     remaining = set(range(len(rows)))
     known: set[str] = set()
     output_rows: list[dict[str, Any]] = []
+    demand = dependency_demand(analyses_by_row)
+    requirements_by_row = zero_requirement_sets(analyses_by_row)
+    row_form_key_sets = [row_form_keys(row) for row in rows]
 
     while remaining:
-        best_choice: tuple[tuple[int, int, int, int, int, int], int, SentenceAnalysis, list[str]] | None = None
-        for input_index in remaining:
-            row = rows[input_index]
-            analysis, dependency_violations, score = best_analysis_for_known(analyses_by_row[input_index], known)
-            choice_score = (
-                score[0] + score[1],
-                score[0],
-                score[1],
-                score[2],
-                -row.occurrence_count,
-                input_index,
-            )
-            if best_choice is None or choice_score < best_choice[0]:
-                best_choice = (choice_score, input_index, analysis, dependency_violations)
+        best_choice: tuple[tuple[int, ...], int, SentenceAnalysis, list[DependencyInfo]] | None = None
+        if algorithm == "closure_seed":
+            zero_choice: tuple[tuple[int, ...], int, SentenceAnalysis, list[DependencyInfo]] | None = None
+            seed_choice: tuple[tuple[int, ...], int, SentenceAnalysis, list[DependencyInfo]] | None = None
+            known_keys = {form.casefold() for form in known}
+            for input_index in remaining:
+                row = rows[input_index]
+                analysis, dependency_violations, score = best_analysis_for_known(analyses_by_row[input_index], known)
+                total_unknown = score[0] + score[1]
+                if total_unknown == 0:
+                    choice_score = choice_sort_key("greedy_unlock", score, row, input_index, known, demand)
+                    if zero_choice is None or choice_score < zero_choice[0]:
+                        zero_choice = (choice_score, input_index, analysis, dependency_violations)
+                    continue
+                closure_size = closure_size_after_seed(
+                    input_index,
+                    remaining,
+                    known_keys,
+                    requirements_by_row,
+                    row_form_key_sets,
+                )
+                choice_score = (
+                    1 if analysis.sentence is None else 0,
+                    -closure_size,
+                    total_unknown,
+                    score[0],
+                    score[1],
+                    score[2],
+                    -row.occurrence_count,
+                    input_index,
+                )
+                if seed_choice is None or choice_score < seed_choice[0]:
+                    seed_choice = (choice_score, input_index, analysis, dependency_violations)
+            best_choice = zero_choice or seed_choice
+        else:
+            for input_index in remaining:
+                row = rows[input_index]
+                analysis, dependency_violations, score = best_analysis_for_known(analyses_by_row[input_index], known)
+                choice_score = choice_sort_key(algorithm, score, row, input_index, known, demand)
+                if best_choice is None or choice_score < best_choice[0]:
+                    best_choice = (choice_score, input_index, analysis, dependency_violations)
 
         if best_choice is None:
             raise RuntimeError("No remaining row could be ordered.")
@@ -324,8 +481,10 @@ def build_ordered_rows(rows: list[TranslationRow], analyses_by_row: list[list[Se
                 "word_class": row.word_class,
                 "translations": row.translations,
                 "example_sentence": analysis.sentence.model_dump(mode="json") if analysis.sentence else None,
-                "dependency_normalized_forms": list(analysis.dependencies),
-                "dependency_violations": dependency_violations,
+                "dependency_normalized_forms": unique_strings(
+                    [dependency.normalized_form for dependency in analysis.dependencies]
+                ),
+                "dependency_violations": [dependency.form for dependency in dependency_violations],
                 "external_unknown_forms": list(analysis.external_unknown_forms),
                 "non_target_unknown_count_after_ordering": non_target_unknown_count,
                 "total_unknown_count_after_ordering": non_target_unknown_count + 1,
@@ -337,7 +496,7 @@ def build_ordered_rows(rows: list[TranslationRow], analyses_by_row: list[list[Se
                 "occurrence_count": row.occurrence_count,
             }
         )
-        known.add(row.normalized_form)
+        known.update(known_form_set(row))
         remaining.remove(input_index)
 
     return output_rows
@@ -349,6 +508,129 @@ def write_jsonl(rows: list[dict[str, Any]], output_path: Path) -> None:
         for row in rows:
             handle.write(orjson.dumps(row))
             handle.write(b"\n")
+
+
+def summarise_metrics(ordered_rows: list[dict[str, Any]], algorithm: str) -> dict[str, Any]:
+    unknown_counts = Counter(row["non_target_unknown_count_after_ordering"] for row in ordered_rows)
+    first_no_sentence = next(
+        (index + 1 for index, row in enumerate(ordered_rows) if row["example_sentence"] is None),
+        None,
+    )
+    no_sentence = sum(1 for row in ordered_rows if row["example_sentence"] is None)
+    dependency_violations = sum(len(row["dependency_violations"]) for row in ordered_rows)
+    external_unknown_forms = sum(len(row["external_unknown_forms"]) for row in ordered_rows)
+    non_target_unknowns = [
+        row["non_target_unknown_count_after_ordering"]
+        for row in ordered_rows
+        if row["example_sentence"] is not None
+    ]
+    return {
+        "algorithm": algorithm,
+        "row_count": len(ordered_rows),
+        "only_target_unknown": sum(
+            1 for row in ordered_rows if row["non_target_unknown_count_after_ordering"] == 0
+        ),
+        "dependency_violations": dependency_violations,
+        "external_unknown_forms": external_unknown_forms,
+        "total_non_target_unknowns": dependency_violations + external_unknown_forms,
+        "cycle_breaks": sum(1 for row in ordered_rows if row["cycle_break"]),
+        "no_sentence": no_sentence,
+        "first_no_sentence": first_no_sentence,
+        "rows_with_external_unknowns": sum(1 for row in ordered_rows if row["external_unknown_forms"]),
+        "rows_with_dependency_violations": sum(1 for row in ordered_rows if row["dependency_violations"]),
+        "max_non_target_unknown_count": max(non_target_unknowns, default=0),
+        "unknown_counts": sorted(unknown_counts.items()),
+    }
+
+
+def save_metrics(
+    metrics_db_path: Path,
+    metrics: dict[str, Any],
+    input_path: Path,
+    entries_input_path: Path,
+    output_path: Path,
+) -> int:
+    metrics_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(metrics_db_path, timeout=30) as connection:
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sentence_order_attempts (
+                attempt_number INTEGER PRIMARY KEY,
+                date_time TEXT NOT NULL,
+                algorithm TEXT NOT NULL,
+                input_path TEXT NOT NULL,
+                entries_input_path TEXT NOT NULL,
+                output_path TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                only_target_unknown INTEGER NOT NULL,
+                dependency_violations INTEGER NOT NULL,
+                external_unknown_forms INTEGER NOT NULL,
+                total_non_target_unknowns INTEGER NOT NULL,
+                cycle_breaks INTEGER NOT NULL,
+                no_sentence INTEGER NOT NULL,
+                first_no_sentence INTEGER,
+                rows_with_external_unknowns INTEGER NOT NULL,
+                rows_with_dependency_violations INTEGER NOT NULL,
+                max_non_target_unknown_count INTEGER NOT NULL,
+                unknown_counts_json TEXT NOT NULL,
+                metrics_json TEXT NOT NULL
+            )
+            """
+        )
+        attempt_number = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM sentence_order_attempts"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            """
+            INSERT INTO sentence_order_attempts (
+                attempt_number,
+                date_time,
+                algorithm,
+                input_path,
+                entries_input_path,
+                output_path,
+                row_count,
+                only_target_unknown,
+                dependency_violations,
+                external_unknown_forms,
+                total_non_target_unknowns,
+                cycle_breaks,
+                no_sentence,
+                first_no_sentence,
+                rows_with_external_unknowns,
+                rows_with_dependency_violations,
+                max_non_target_unknown_count,
+                unknown_counts_json,
+                metrics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_number,
+                datetime.now(timezone.utc).isoformat(),
+                metrics["algorithm"],
+                str(input_path),
+                str(entries_input_path),
+                str(output_path),
+                metrics["row_count"],
+                metrics["only_target_unknown"],
+                metrics["dependency_violations"],
+                metrics["external_unknown_forms"],
+                metrics["total_non_target_unknowns"],
+                metrics["cycle_breaks"],
+                metrics["no_sentence"],
+                metrics["first_no_sentence"],
+                metrics["rows_with_external_unknowns"],
+                metrics["rows_with_dependency_violations"],
+                metrics["max_non_target_unknown_count"],
+                orjson.dumps(metrics["unknown_counts"]).decode(),
+                orjson.dumps(metrics).decode(),
+            ),
+        )
+    return attempt_number
 
 
 @app.command()
@@ -380,26 +662,55 @@ def main(
         writable=True,
         help="Path to write ordered sentence JSONL.",
     ),
+    metrics_db_path: Path = typer.Option(
+        DEFAULT_METRICS_DB_PATH,
+        "--metrics-db",
+        file_okay=True,
+        dir_okay=False,
+        writable=True,
+        help="Path to SQLite DB for sentence-ordering attempt metrics.",
+    ),
+    algorithm: str = typer.Option(
+        "closure_seed",
+        "--algorithm",
+        help="Ordering algorithm: closure_seed, greedy, greedy_unlock, greedy_unlock_frequency, or greedy_frequency_unlock.",
+    ),
 ) -> None:
+    valid_algorithms = {
+        "closure_seed",
+        "greedy",
+        "greedy_unlock",
+        "greedy_unlock_frequency",
+        "greedy_frequency_unlock",
+    }
+    if algorithm not in valid_algorithms:
+        raise typer.BadParameter(f"algorithm must be one of: {', '.join(sorted(valid_algorithms))}")
+
     rows = [row for row in load_jsonl(input_path, TranslationRow) if isinstance(row, TranslationRow)]
     entries = [entry for entry in load_jsonl(entries_input_path, LemmaEntry) if isinstance(entry, LemmaEntry)]
     entry_index = build_entry_index(entries)
     rows = enrich_rows(rows, entry_index)
-    exact_form_map, casefold_form_map = build_form_maps(rows)
+    exact_form_map, casefold_form_map, form_label_map = build_form_maps(rows)
     analyses_by_row = [
-        build_sentence_analyses(row, entry_index, exact_form_map, casefold_form_map)
+        build_sentence_analyses(row, entry_index, exact_form_map, casefold_form_map, form_label_map)
         for row in rows
     ]
-    ordered_rows = build_ordered_rows(rows, analyses_by_row)
+    ordered_rows = build_ordered_rows(rows, analyses_by_row, algorithm)
     write_jsonl(ordered_rows, output_path)
+    metrics = summarise_metrics(ordered_rows, algorithm)
+    attempt_number = save_metrics(metrics_db_path, metrics, input_path, entries_input_path, output_path)
 
     typer.echo(f"output={output_path}")
-    typer.echo(f"row_count={len(ordered_rows)}")
-    typer.echo(
-        f"only_target_unknown={sum(1 for row in ordered_rows if row['non_target_unknown_count_after_ordering'] == 0)}"
-    )
-    typer.echo(f"dependency_violations={sum(len(row['dependency_violations']) for row in ordered_rows)}")
-    typer.echo(f"cycle_breaks={sum(1 for row in ordered_rows if row['cycle_break'])}")
+    typer.echo(f"metrics_db={metrics_db_path}")
+    typer.echo(f"attempt_number={attempt_number}")
+    typer.echo(f"row_count={metrics['row_count']}")
+    typer.echo(f"only_target_unknown={metrics['only_target_unknown']}")
+    typer.echo(f"dependency_violations={metrics['dependency_violations']}")
+    typer.echo(f"external_unknown_forms={metrics['external_unknown_forms']}")
+    typer.echo(f"cycle_breaks={metrics['cycle_breaks']}")
+    typer.echo(f"no_sentence={metrics['no_sentence']}")
+    typer.echo(f"first_no_sentence={metrics['first_no_sentence']}")
+    typer.echo(f"unknown_counts={metrics['unknown_counts']}")
 
 
 if __name__ == "__main__":
