@@ -20,13 +20,54 @@ def enable_sqlite_foreign_keys(dbapi_connection: object, _: object) -> None:
     cursor.close()
 
 
-class SubtitleFile(Base):
-    __tablename__ = "subtitle_files"
+class Scope(Base):
+    __tablename__ = "scopes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    path: Mapped[str] = mapped_column(String(1024), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    language: Mapped[str] = mapped_column(String(32), nullable=False, default="el")
+    created_at: Mapped[str] = mapped_column(
+        Text,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
+
+    subtitle_files: Mapped[list["SubtitleFile"]] = relationship(
+        back_populates="scope",
+        cascade="all, delete-orphan",
+    )
+    sentences: Mapped[list["Sentence"]] = relationship(
+        back_populates="scope",
+        cascade="all, delete-orphan",
+    )
+    lemmas: Mapped[list["Lemma"]] = relationship(
+        back_populates="scope",
+        cascade="all, delete-orphan",
+    )
+    original_forms: Mapped[list["OriginalForm"]] = relationship(
+        back_populates="scope",
+        cascade="all, delete-orphan",
+    )
+    reviewed_lexemes: Mapped[list["ReviewedLexeme"]] = relationship(
+        back_populates="scope",
+        cascade="all, delete-orphan",
+    )
+    normalized_lexemes: Mapped[list["NormalizedLexeme"]] = relationship(
+        back_populates="scope",
+        cascade="all, delete-orphan",
+    )
+
+
+class SubtitleFile(Base):
+    __tablename__ = "subtitle_files"
+    __table_args__ = (UniqueConstraint("scope_id", "path"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
+    path: Mapped[str] = mapped_column(String(1024), index=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
 
+    scope: Mapped[Scope] = relationship(back_populates="subtitle_files")
     sentences: Mapped[list["Sentence"]] = relationship(
         back_populates="subtitle_file",
         cascade="all, delete-orphan",
@@ -43,10 +84,12 @@ class Sentence(Base):
     __table_args__ = (UniqueConstraint("subtitle_file_id", "sequence_number"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
     subtitle_file_id: Mapped[int] = mapped_column(ForeignKey("subtitle_files.id"), index=True)
     sequence_number: Mapped[int] = mapped_column(index=True)
     text: Mapped[str] = mapped_column(Text)
 
+    scope: Mapped[Scope] = relationship(back_populates="sentences")
     subtitle_file: Mapped[SubtitleFile] = relationship(back_populates="sentences")
     occurrences: Mapped[list["TokenOccurrence"]] = relationship(
         back_populates="sentence",
@@ -57,11 +100,14 @@ class Sentence(Base):
 
 class Lemma(Base):
     __tablename__ = "lemmas"
+    __table_args__ = (UniqueConstraint("scope_id", "text"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    text: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
+    text: Mapped[str] = mapped_column(String(255), index=True)
     total_occurrences: Mapped[int] = mapped_column(default=0, nullable=False)
 
+    scope: Mapped[Scope] = relationship(back_populates="lemmas")
     original_forms: Mapped[list["OriginalForm"]] = relationship(
         back_populates="lemma",
         cascade="all, delete-orphan",
@@ -75,12 +121,15 @@ class Lemma(Base):
 
 class OriginalForm(Base):
     __tablename__ = "original_forms"
+    __table_args__ = (UniqueConstraint("scope_id", "text"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    text: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
+    text: Mapped[str] = mapped_column(String(255), index=True)
     lemma_id: Mapped[int] = mapped_column(ForeignKey("lemmas.id"), index=True)
     total_occurrences: Mapped[int] = mapped_column(default=0, nullable=False)
 
+    scope: Mapped[Scope] = relationship(back_populates="original_forms")
     lemma: Mapped[Lemma] = relationship(back_populates="original_forms")
     occurrences: Mapped[list["TokenOccurrence"]] = relationship(
         back_populates="original_form",
@@ -101,6 +150,7 @@ class OriginalFormFileCount(Base):
     __table_args__ = (UniqueConstraint("original_form_id", "subtitle_file_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
     original_form_id: Mapped[int] = mapped_column(ForeignKey("original_forms.id"), index=True)
     subtitle_file_id: Mapped[int] = mapped_column(ForeignKey("subtitle_files.id"), index=True)
     occurrence_count: Mapped[int] = mapped_column(default=0, nullable=False)
@@ -114,6 +164,7 @@ class TokenOccurrence(Base):
     __table_args__ = (UniqueConstraint("sentence_id", "token_position"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
     sentence_id: Mapped[int] = mapped_column(ForeignKey("sentences.id"), index=True)
     original_form_id: Mapped[int] = mapped_column(ForeignKey("original_forms.id"), index=True)
     token_position: Mapped[int] = mapped_column(index=True)
@@ -126,6 +177,7 @@ class ReviewedLexeme(Base):
     __tablename__ = "reviewed_lexemes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
     source_lemma_id: Mapped[int] = mapped_column(ForeignKey("lemmas.id"), index=True)
     normalized_form: Mapped[str] = mapped_column(String(255), index=True)
     word_class: Mapped[str] = mapped_column(String(32), index=True)
@@ -140,8 +192,13 @@ class ReviewedLexeme(Base):
         nullable=False,
     )
 
+    scope: Mapped[Scope] = relationship(back_populates="reviewed_lexemes")
     source_lemma: Mapped[Lemma] = relationship(back_populates="reviewed_lexemes")
     reviewed_original_forms: Mapped[list["ReviewedLexemeOriginalForm"]] = relationship(
+        back_populates="reviewed_lexeme",
+        cascade="all, delete-orphan",
+    )
+    normalized_lexeme_links: Mapped[list["NormalizedLexemeReviewedLexeme"]] = relationship(
         back_populates="reviewed_lexeme",
         cascade="all, delete-orphan",
     )
@@ -161,6 +218,88 @@ class ReviewedLexemeOriginalForm(Base):
 
     reviewed_lexeme: Mapped[ReviewedLexeme] = relationship(back_populates="reviewed_original_forms")
     original_form: Mapped[OriginalForm] = relationship(back_populates="reviewed_lexeme_links")
+
+
+class NormalizedLexeme(Base):
+    __tablename__ = "normalized_lexemes"
+    __table_args__ = (UniqueConstraint("scope_id", "normalized_form"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
+    normalized_form: Mapped[str] = mapped_column(String(255), index=True)
+    word_class: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[str] = mapped_column(
+        Text,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
+    updated_at: Mapped[str] = mapped_column(
+        Text,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
+
+    scope: Mapped[Scope] = relationship(back_populates="normalized_lexemes")
+    reviewed_lexeme_links: Mapped[list["NormalizedLexemeReviewedLexeme"]] = relationship(
+        back_populates="normalized_lexeme",
+        cascade="all, delete-orphan",
+    )
+    ordering: Mapped["NormalizedLexemeOrdering | None"] = relationship(
+        back_populates="normalized_lexeme",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class NormalizedLexemeReviewedLexeme(Base):
+    __tablename__ = "normalized_lexeme_reviewed_lexemes"
+
+    normalized_lexeme_id: Mapped[int] = mapped_column(
+        ForeignKey("normalized_lexemes.id"),
+        primary_key=True,
+    )
+    reviewed_lexeme_id: Mapped[int] = mapped_column(
+        ForeignKey("reviewed_lexemes.id"),
+        primary_key=True,
+    )
+
+    normalized_lexeme: Mapped[NormalizedLexeme] = relationship(back_populates="reviewed_lexeme_links")
+    reviewed_lexeme: Mapped[ReviewedLexeme] = relationship(back_populates="normalized_lexeme_links")
+
+
+class NormalizedLexemeOrdering(Base):
+    __tablename__ = "normalized_lexeme_ordering"
+    __table_args__ = (UniqueConstraint("scope_id", "order_index"),)
+
+    normalized_lexeme_id: Mapped[int] = mapped_column(
+        ForeignKey("normalized_lexemes.id"),
+        primary_key=True,
+    )
+    scope_id: Mapped[int] = mapped_column(ForeignKey("scopes.id"), index=True)
+    order_index: Mapped[int] = mapped_column(index=True)
+    example_sentence_id: Mapped[int | None] = mapped_column(ForeignKey("sentences.id"), nullable=True, index=True)
+    algorithm: Mapped[str] = mapped_column(String(64), nullable=False, default="closure_seed")
+    dependency_normalized_forms_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    dependency_violations_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    external_unknown_forms_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    non_target_unknown_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    total_unknown_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    sentence_token_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    candidate_sentence_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    cycle_break: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[str] = mapped_column(
+        Text,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
+    updated_at: Mapped[str] = mapped_column(
+        Text,
+        server_default=text("CURRENT_TIMESTAMP"),
+        nullable=False,
+    )
+
+    normalized_lexeme: Mapped[NormalizedLexeme] = relationship(back_populates="ordering")
+    example_sentence: Mapped[Sentence | None] = relationship()
 
 
 class PromptCacheEntry(CacheBase):

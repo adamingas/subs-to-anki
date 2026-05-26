@@ -97,22 +97,22 @@ class ReviewedLexemeRow(BaseModel):
 class TranslationCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reviewed_lexeme_id: int
+    normalized_lexeme_id: int
     normalized_form: str
     word_class: LexemeClass
-    source_lemma: str
+    source_lemmas: list[str] = Field(..., min_length=1)
     original_forms: list[str] = Field(..., min_length=1)
     sentences: list[SentenceContext] = Field(..., min_length=1)
     occurrence_count: int
+    example_sentence: SentenceContext | None = None
 
 
 class TranslationPromptInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    reviewed_lexeme_id: int
     normalized_form: str
     word_class: LexemeClass
-    source_lemma: str
+    source_lemmas: list[str] = Field(..., min_length=1)
     original_forms: list[str] = Field(..., min_length=1)
     example_sentence: SentenceContext
     occurrence_count: int

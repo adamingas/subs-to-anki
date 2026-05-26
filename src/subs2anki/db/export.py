@@ -11,13 +11,14 @@ from subs2anki.db.core import create_engine_for_path
 from subs2anki.db.models import OriginalForm, Sentence, TokenOccurrence
 
 
-def collect_lemma_entries(session: Session) -> list[dict[str, Any]]:
+def collect_lemma_entries(session: Session, scope_id: int) -> list[dict[str, Any]]:
     statement = (
         select(TokenOccurrence)
         .options(
             joinedload(TokenOccurrence.original_form).joinedload(OriginalForm.lemma),
             joinedload(TokenOccurrence.sentence).joinedload(Sentence.subtitle_file),
         )
+        .where(TokenOccurrence.scope_id == scope_id)
         .order_by(TokenOccurrence.id)
     )
     occurrences = session.scalars(statement).all()
@@ -80,8 +81,8 @@ def write_jsonl(rows: Sequence[dict[str, Any]], output_path: Path) -> Path:
     return output_path
 
 
-def export_lemma_entries_jsonl(db_path: Path, output_path: Path) -> Path:
+def export_lemma_entries_jsonl(db_path: Path, output_path: Path, scope_id: int) -> Path:
     engine = create_engine_for_path(db_path)
     with Session(engine) as session:
-        rows = collect_lemma_entries(session)
+        rows = collect_lemma_entries(session, scope_id=scope_id)
     return write_jsonl(rows, output_path)

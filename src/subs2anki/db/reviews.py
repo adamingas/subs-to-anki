@@ -20,11 +20,11 @@ from subs2anki.db.models import (
 from subs2anki.llm.types import LemmaCandidate, ReviewedLexemeRow, SentenceContext
 
 
-def load_review_candidates(db_path: Path) -> list[LemmaCandidate]:
+def load_review_candidates(db_path: Path, scope_id: int) -> list[LemmaCandidate]:
     engine = create_engine_for_path(db_path)
     try:
         with Session(engine) as session:
-            rows = collect_lemma_entries(session)
+            rows = collect_lemma_entries(session, scope_id=scope_id)
     finally:
         engine.dispose()
     return [LemmaCandidate.model_validate(row) for row in rows]
@@ -32,6 +32,7 @@ def load_review_candidates(db_path: Path) -> list[LemmaCandidate]:
 
 def replace_reviewed_lexemes(
     db_path: Path,
+    scope_id: int,
     review_rows_by_lemma: dict[str, list[ReviewedLexemeRow]],
 ) -> None:
     engine = create_engine_for_path(db_path)
@@ -44,17 +45,19 @@ def replace_reviewed_lexemes(
                 for lemma in session.scalars(
                     select(Lemma)
                     .options(joinedload(Lemma.original_forms))
-                    .where(Lemma.text.in_(lemma_texts))
+                    .where(Lemma.scope_id == scope_id, Lemma.text.in_(lemma_texts))
                 ).unique()
             }
 
             missing = [lemma_text for lemma_text in lemma_texts if lemma_text not in source_lemmas]
             if missing:
-                raise RuntimeError(f"Could not find source lemmas in DB: {', '.join(missing)}")
+                raise RuntimeError(f"Could not find scoped source lemmas in DB: {', '.join(missing)}")
 
-            for source_lemma in source_lemmas.values():
-                for existing in list(source_lemma.reviewed_lexemes):
-                    session.delete(existing)
+            existing_reviewed_lexemes = session.scalars(
+                select(ReviewedLexeme).where(ReviewedLexeme.scope_id == scope_id)
+            ).all()
+            for existing in existing_reviewed_lexemes:
+                session.delete(existing)
 
             session.flush()
 
@@ -64,6 +67,7 @@ def replace_reviewed_lexemes(
 
                 for row in review_rows_by_lemma[lemma_text]:
                     reviewed_lexeme = ReviewedLexeme(
+                        scope_id=scope_id,
                         source_lemma=source_lemma,
                         normalized_form=row.normalized_form,
                         word_class=row.word_class.value,
@@ -89,7 +93,7 @@ def replace_reviewed_lexemes(
         engine.dispose()
 
 
-def collect_reviewed_lexeme_rows(session: Session) -> list[dict[str, Any]]:
+def collect_reviewed_lexeme_rows(session: Session, scope_id: int) -> list[dict[str, Any]]:
     reviewed_lexemes = session.scalars(
         select(ReviewedLexeme)
         .options(
@@ -98,6 +102,7 @@ def collect_reviewed_lexeme_rows(session: Session) -> list[dict[str, Any]]:
                 ReviewedLexemeOriginalForm.original_form
             ),
         )
+        .where(ReviewedLexeme.scope_id == scope_id)
         .order_by(ReviewedLexeme.source_lemma_id, ReviewedLexeme.normalized_form, ReviewedLexeme.word_class)
     ).unique()
 
@@ -119,18 +124,18 @@ def collect_reviewed_lexeme_rows(session: Session) -> list[dict[str, Any]]:
     return rows
 
 
-def export_reviewed_lexemes_jsonl(db_path: Path, output_path: Path) -> Path:
+def export_reviewed_lexemes_jsonl(db_path: Path, output_path: Path, scope_id: int) -> Path:
     engine = create_engine_for_path(db_path)
     try:
         create_schema(engine)
         with Session(engine) as session:
-            rows = collect_reviewed_lexeme_rows(session)
+            rows = collect_reviewed_lexeme_rows(session, scope_id=scope_id)
     finally:
         engine.dispose()
     return write_jsonl(rows, output_path)
 
 
-def load_reviewed_lexeme_sentences(db_path: Path, reviewed_lexeme_id: int) -> list[SentenceContext]:
+def load_reviewed_lexeme_sentences(db_path: Path, scope_id: int, reviewed_lexeme_id: int) -> list[SentenceContext]:
     engine = create_engine_for_path(db_path)
     try:
         with Session(engine) as session:
@@ -142,8 +147,12 @@ def load_reviewed_lexeme_sentences(db_path: Path, reviewed_lexeme_id: int) -> li
                     ReviewedLexemeOriginalForm,
                     ReviewedLexemeOriginalForm.original_form_id == OriginalForm.id,
                 )
+                .join(ReviewedLexeme, ReviewedLexeme.id == ReviewedLexemeOriginalForm.reviewed_lexeme_id)
                 .join(SubtitleFile, SubtitleFile.id == Sentence.subtitle_file_id)
-                .where(ReviewedLexemeOriginalForm.reviewed_lexeme_id == reviewed_lexeme_id)
+                .where(
+                    ReviewedLexeme.scope_id == scope_id,
+                    ReviewedLexemeOriginalForm.reviewed_lexeme_id == reviewed_lexeme_id,
+                )
                 .distinct()
                 .order_by(Sentence.id)
             ).all()

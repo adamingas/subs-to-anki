@@ -9,15 +9,17 @@ from typing import Any, Sequence
 import simplemma  # type: ignore
 from sqlalchemy.orm import Session
 
-from subs2anki.db.core import create_engine_for_path, create_schema, reset_database
+from subs2anki.db.core import create_engine_for_path, create_schema, resolve_db_path
 from subs2anki.db.models import (
     Lemma,
     OriginalForm,
     OriginalFormFileCount,
+    Scope,
     Sentence,
     SubtitleFile,
     TokenOccurrence,
 )
+from subs2anki.db.scopes import create_scope
 from subs2anki.subtitles import (
     build_nlp,
     extract_document_sentences,
@@ -29,6 +31,8 @@ from subs2anki.subtitles import (
 
 @dataclass(slots=True)
 class ImportStats:
+    scope_id: int = 0
+    scope_name: str = ""
     files: int = 0
     sentences: int = 0
     lemmas: int = 0
@@ -38,6 +42,7 @@ class ImportStats:
 
 def get_or_create_lemma(
     session: Session,
+    scope: Scope,
     lemma_cache: dict[str, Lemma],
     lemma_text: str,
     stats: ImportStats,
@@ -46,7 +51,7 @@ def get_or_create_lemma(
     if lemma is not None:
         return lemma
 
-    lemma = Lemma(text=lemma_text, total_occurrences=0)
+    lemma = Lemma(scope=scope, text=lemma_text, total_occurrences=0)
     session.add(lemma)
     lemma_cache[lemma_text] = lemma
     stats.lemmas += 1
@@ -55,6 +60,7 @@ def get_or_create_lemma(
 
 def get_or_create_original_form(
     session: Session,
+    scope: Scope,
     form_cache: dict[str, OriginalForm],
     form_text: str,
     lemma: Lemma,
@@ -69,7 +75,7 @@ def get_or_create_original_form(
             )
         return form
 
-    form = OriginalForm(text=form_text, lemma=lemma, total_occurrences=0)
+    form = OriginalForm(scope=scope, text=form_text, lemma=lemma, total_occurrences=0)
     session.add(form)
     form_cache[form_text] = form
     stats.original_forms += 1
@@ -78,6 +84,7 @@ def get_or_create_original_form(
 
 def ingest_subtitle_file(
     session: Session,
+    scope: Scope,
     path: Path,
     nlp: Any,
     language: str,
@@ -85,7 +92,7 @@ def ingest_subtitle_file(
     form_cache: dict[str, OriginalForm],
     stats: ImportStats,
 ) -> None:
-    subtitle_file = SubtitleFile(path=str(path), name=path.name)
+    subtitle_file = SubtitleFile(scope=scope, path=str(path), name=path.name)
     session.add(subtitle_file)
     session.flush()
     stats.files += 1
@@ -94,6 +101,7 @@ def ingest_subtitle_file(
 
     for sequence_number, sentence_text in enumerate(extract_document_sentences(path, nlp), start=1):
         sentence = Sentence(
+            scope=scope,
             subtitle_file=subtitle_file,
             sequence_number=sequence_number,
             text=sentence_text,
@@ -110,11 +118,12 @@ def ingest_subtitle_file(
             if not lemma_text:
                 continue
 
-            lemma = get_or_create_lemma(session, lemma_cache, lemma_text, stats)
-            form = get_or_create_original_form(session, form_cache, normalized_token, lemma, stats)
+            lemma = get_or_create_lemma(session, scope, lemma_cache, lemma_text, stats)
+            form = get_or_create_original_form(session, scope, form_cache, normalized_token, lemma, stats)
 
             session.add(
                 TokenOccurrence(
+                    scope_id=scope.id,
                     sentence=sentence,
                     original_form=form,
                     token_position=token_position,
@@ -128,6 +137,7 @@ def ingest_subtitle_file(
     for form_text, occurrence_count in sorted(file_counts.items()):
         session.add(
             OriginalFormFileCount(
+                scope_id=scope.id,
                 original_form=form_cache[form_text],
                 subtitle_file=subtitle_file,
                 occurrence_count=occurrence_count,
@@ -139,9 +149,11 @@ def import_subtitles(
     files: Sequence[Path],
     db_path: Path,
     language: str,
+    scope_name: str,
 ) -> tuple[Path, ImportStats]:
     input_paths = validate_input_paths(files)
-    resolved_db_path = reset_database(db_path)
+    resolved_db_path = resolve_db_path(db_path)
+    resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine_for_path(resolved_db_path)
     create_schema(engine)
 
@@ -151,9 +163,13 @@ def import_subtitles(
     form_cache: dict[str, OriginalForm] = {}
 
     with Session(engine) as session:
+        scope = create_scope(session, name=scope_name, language=language)
+        stats.scope_id = scope.id
+        stats.scope_name = scope.name
         for path in input_paths:
             ingest_subtitle_file(
                 session,
+                scope=scope,
                 path=path,
                 nlp=nlp,
                 language=language,

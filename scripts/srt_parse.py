@@ -30,9 +30,21 @@ def main(
         "--language",
         help="Language code passed to the lemmatizer.",
     ),
+    scope_name: str = typer.Option(
+        ...,
+        "--scope-name",
+        help="Invocation scope name to create for this import.",
+    ),
 ) -> None:
-    resolved_db_path, stats = import_subtitles(files=files, db_path=db_path, language=language)
+    resolved_db_path, stats = import_subtitles(
+        files=files,
+        db_path=db_path,
+        language=language,
+        scope_name=scope_name,
+    )
     typer.echo(f"db={resolved_db_path}")
+    typer.echo(f"scope_id={stats.scope_id}")
+    typer.echo(f"scope_name={stats.scope_name}")
     typer.echo(
         " ".join(
             [

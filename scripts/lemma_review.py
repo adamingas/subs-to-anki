@@ -13,7 +13,12 @@ import typer
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-from subs2anki.db import export_reviewed_lexemes_jsonl, load_review_candidates, replace_reviewed_lexemes
+from subs2anki.db import (
+    export_reviewed_lexemes_jsonl,
+    load_review_candidates,
+    replace_reviewed_lexemes,
+    resolve_scope_id,
+)
 from subs2anki.llm import (
     LemmaCandidate,
     LexemeClass,
@@ -150,11 +155,6 @@ Output JSON:
 {"lexemes":[{"normalized_form":"εσύ","word_class":"pronoun","original_forms":["Εσύ","εσύ"]},{"normalized_form":"εσένα","word_class":"pronoun","original_forms":["εσένα"]}]}
 
 Input JSON:
-{"lemmatised_form":"τα","count":7,"original_forms":["Εγώ","εγώ","Εμένα","εμένα","Εσύ","εσύ","εσένα"],"sentences":[{"sentence_text":"Εγώ μιλάω τώρα.","source_srt":"data/raw/example.srt"},{"sentence_text":"Εμένα ποιος θα με ακούσει;","source_srt":"data/raw/example.srt"},{"sentence_text":"Εσύ τι λες;","source_srt":"data/raw/example.srt"},{"sentence_text":"Εσένα περίμενα.","source_srt":"data/raw/example.srt"}]}
-Output JSON:
-{"lexemes":[{"normalized_form":"εγώ","word_class":"pronoun","original_forms":["Εγώ","εγώ"]},{"normalized_form":"εμένα","word_class":"pronoun","original_forms":["Εμένα","εμένα"]},{"normalized_form":"εσύ","word_class":"pronoun","original_forms":["Εσύ","εσύ"]},{"normalized_form":"εσένα","word_class":"pronoun","original_forms":["εσένα"]}]}
-
-Input JSON:
 {"lemmatised_form":"σε","count":2,"original_forms":["σε"],"sentences":[{"sentence_text":"Ήρθα σε σένα.","source_srt":"data/raw/example.srt"}]}
 Output JSON:
 {"lexemes":[{"normalized_form":"σε","word_class":"preposition","original_forms":["σε"]}]}
@@ -187,7 +187,7 @@ Output JSON:
 Input JSON:
 {"lemmatised_form":"}δεν","count":1,"original_forms":["}δεν"],"sentences":[{"sentence_text":"}δεν ξέρω","source_srt":"data/raw/example.srt"}]}
 Output JSON:
-{"lexemes":[{"normalized_form":"}δεν","word_class":"other","original_forms":["}δεν"]}]}
+{"lexemes":[{"normalized_form":"δεν","word_class":"particle","original_forms":["}δεν"]}]}
 
 Output format:
 Return JSON with exactly this shape:
@@ -489,6 +489,7 @@ async def review_candidate(
 async def run_reviews(
     *,
     db_path: Path,
+    scope_id: int,
     output_path: Path,
     base_url: str,
     api_key: str,
@@ -496,7 +497,7 @@ async def run_reviews(
     concurrency: int,
     thinking: bool,
 ) -> tuple[str, dict[str, list[ReviewedLexemeRow]], list[dict[str, Any]]]:
-    candidates = load_review_candidates(db_path)
+    candidates = load_review_candidates(db_path, scope_id=scope_id)
     cache = PromptCacheStore(db_path)
     await cache.open()
     client: AsyncOpenAI | None = None
@@ -527,8 +528,8 @@ async def run_reviews(
         await cache.close()
 
     review_rows_by_lemma = {lemma_text: rows for lemma_text, rows, _ in results}
-    replace_reviewed_lexemes(db_path, review_rows_by_lemma)
-    export_reviewed_lexemes_jsonl(db_path, output_path)
+    replace_reviewed_lexemes(db_path, scope_id=scope_id, review_rows_by_lemma=review_rows_by_lemma)
+    export_reviewed_lexemes_jsonl(db_path, output_path, scope_id=scope_id)
     return model, review_rows_by_lemma, [cache_entry for _, _, cache_entry in results]
 
 
@@ -577,6 +578,11 @@ def main(
         "--thinking/--no-thinking",
         help="Enable or disable model thinking mode.",
     ),
+    scope_name: str | None = typer.Option(
+        None,
+        "--scope",
+        help="Scope name to review. If omitted, the only scope in the DB is used.",
+    ),
 ) -> None:
     if (base_url and not token) or (token and not base_url):
         typer.echo(
@@ -586,9 +592,11 @@ def main(
         raise typer.Exit(code=1)
 
     try:
+        scope_id = resolve_scope_id(db_path, scope_name=scope_name)
         resolved_model, review_rows_by_lemma, cache_entries = asyncio.run(
             run_reviews(
                 db_path=db_path,
+                scope_id=scope_id,
                 output_path=output_path,
                 base_url=base_url,
                 api_key=token,
@@ -603,6 +611,9 @@ def main(
 
     typer.echo(f"model={resolved_model}")
     typer.echo(f"db={db_path}")
+    typer.echo(f"scope_id={scope_id}")
+    if scope_name is not None:
+        typer.echo(f"scope_name={scope_name}")
     typer.echo(f"output={output_path}")
     typer.echo("cache_db=same as --db")
     typer.echo(f"reviewed_lemmas={len(review_rows_by_lemma)}")

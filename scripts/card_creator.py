@@ -2,165 +2,114 @@
 
 from __future__ import annotations
 
-import asyncio
-import html
 import json
-import os
 from pathlib import Path
 from typing import Any
 
 import typer
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict
-
-from subs2anki.db import load_translation_candidates
-from subs2anki.db.export import write_jsonl
-from subs2anki.llm import (
-    PromptCacheStore,
-    SentenceContext,
-    TranslationCandidate,
-    TranslationPromptInput,
-    TranslationResponse,
-    pick_model,
-    run_cached_structured_completion,
-)
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
-ROOT_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(ROOT_ENV_PATH)
-
-DEFAULT_DB_PATH = Path("data/subs2anki.sqlite3")
-DEFAULT_OUTPUT_JSONL_PATH = Path("data/card_creator_results.jsonl")
+DEFAULT_INPUT_PATH = Path("data/translation_pass.all.jsonl")
 DEFAULT_OUTPUT_TSV_PATH = Path("data/anki_cards.tsv")
 DEFAULT_OUTPUT_APKG_PATH = Path("data/anki_cards.apkg")
-DEFAULT_BASE_URL = os.environ.get("BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-DEFAULT_TOKEN = os.environ.get("OPENAI_TOKEN") or os.environ.get("OPENAI_API_KEY")
-DEFAULT_MODEL = "google/gemma-4-31b-it"
 DEFAULT_DECK_NAME = "Greek Lemmas"
-TEMPERATURE = 0.2
-MAX_TOKENS = 384
-REASONING_EFFORT: str | None = "none"
-MAX_RETRIES = 5
 ANKI_MODEL_ID = 1387426501
 
-SYSTEM_PROMPT = """You are creating concise learner-facing English translations for Modern Greek study cards.
 
-Task:
-Given one reviewed learner-facing normalized form and one selected Greek example sentence, return:
-- a short learner-facing English translation for the target word
-- a natural English translation of the selected example sentence
+class SentenceContext(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
-Rules:
-- Translate `normalized_form`, not `source_lemma`.
-- Use `word_class`, `original_forms`, and `example_sentence` to disambiguate the sense.
-- `english_translation` should be short and compact, suitable for the back of a flashcard.
-- `example_sentence_translation` should be a natural full-sentence English translation of `example_sentence.sentence_text`.
-- Prefer lowercase for `english_translation` unless the target is a proper noun.
-- Do not explain, justify, transliterate, or add notes.
-- Do not include quotation marks.
-
-Input JSON:
-{"reviewed_lexeme_id":7,"normalized_form":"ηρεμώ","word_class":"verb","source_lemma":"ηρέμησε","original_forms":["ηρέμησε","Ηρέμησε","ηρεμήσω"],"example_sentence":{"sentence_text":"Θέλω να ηρεμήσω και δεν θέλω να πάρω χάπια.","source_srt":"data/raw/example.srt"},"occurrence_count":7}
-Output JSON:
-{"english_translation":"calm down; relax","example_sentence_translation":"I want to calm down and I don't want to take pills."}
-
-Input JSON:
-{"reviewed_lexeme_id":12,"normalized_form":"σπίτι","word_class":"noun","source_lemma":"σπίτι","original_forms":["σπίτι"],"example_sentence":{"sentence_text":"Χωρίς συγγνώμη, σπίτι δεν γυρίζεις.","source_srt":"data/raw/example.srt"},"occurrence_count":14}
-Output JSON:
-{"english_translation":"home; house","example_sentence_translation":"Without an apology, you're not going back home."}
-
-Output format:
-Return JSON with exactly this shape:
-{"english_translation":"...","example_sentence_translation":"..."}
-"""
+    sentence_text: str
+    source_srt: str
 
 
-class CardResultRow(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class TranslationPassRow(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
-    reviewed_lexeme_id: int
+    normalized_lexeme_id: int
     normalized_form: str
     word_class: str
-    source_lemma: str
+    source_lemmas: list[str]
     original_forms: list[str]
     occurrence_count: int
     example_sentence: SentenceContext
     english_translation: str | None = None
     example_sentence_translation: str | None = None
-    front: str | None = None
-    back_html: str | None = None
-    cache: dict[str, Any]
 
 
-def pick_example_sentence(candidate: TranslationCandidate) -> SentenceContext:
-    if not candidate.sentences:
-        raise RuntimeError(
-            f"No sentence context available for reviewed lexeme id {candidate.reviewed_lexeme_id}."
+class CardRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    normalized_lexeme_id: int
+    word: str
+    part_of_speech: str
+    meaning: str
+    example_sentence: str
+    sentence_translation: str
+
+
+def load_jsonl(path: Path, model: type[BaseModel]) -> list[BaseModel]:
+    rows: list[BaseModel] = []
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not raw_line.strip():
+            continue
+        try:
+            rows.append(model.model_validate(json.loads(raw_line)))
+        except Exception as exc:
+            raise RuntimeError(f"Invalid JSONL row at {path}:{line_number}: {exc}") from exc
+    return rows
+
+
+def filter_rows(
+    rows: list[TranslationPassRow],
+    *,
+    exclude_proper_nouns: bool,
+) -> list[TranslationPassRow]:
+    if not exclude_proper_nouns:
+        return rows
+    return [row for row in rows if row.word_class != "proper_noun"]
+
+
+def build_card_rows(rows: list[TranslationPassRow], limit: int | None) -> list[CardRow]:
+    selected = rows[:limit] if limit is not None else rows
+    cards: list[CardRow] = []
+    seen_words: set[str] = set()
+    for row in selected:
+        if not row.english_translation or not row.example_sentence_translation:
+            continue
+        word = row.normalized_form.strip()
+        dedupe_key = word.casefold()
+        if dedupe_key in seen_words:
+            continue
+        seen_words.add(dedupe_key)
+        cards.append(
+            CardRow(
+                normalized_lexeme_id=row.normalized_lexeme_id,
+                word=word,
+                part_of_speech=row.word_class.replace("_", " ").strip(),
+                meaning=row.english_translation.strip(),
+                example_sentence=row.example_sentence.sentence_text.strip(),
+                sentence_translation=row.example_sentence_translation.strip(),
+            )
         )
-    # Placeholder until sentence-selection becomes its own DB-backed step.
-    return candidate.sentences[0]
+    return cards
 
 
-def build_translation_input(candidate: TranslationCandidate) -> TranslationPromptInput:
-    return TranslationPromptInput(
-        reviewed_lexeme_id=candidate.reviewed_lexeme_id,
-        normalized_form=candidate.normalized_form,
-        word_class=candidate.word_class,
-        source_lemma=candidate.source_lemma,
-        original_forms=list(candidate.original_forms),
-        example_sentence=pick_example_sentence(candidate),
-        occurrence_count=candidate.occurrence_count,
-    )
-
-
-def build_card_result(
-    candidate: TranslationCandidate,
-    prompt_input: TranslationPromptInput,
-    translation: TranslationResponse | None,
-    cache_info: dict[str, Any],
-) -> CardResultRow:
-    english_translation = None
-    example_sentence_translation = None
-    front = None
-    back_html = None
-
-    if translation is not None:
-        english_translation = translation.english_translation.strip()
-        example_sentence_translation = translation.example_sentence_translation.strip()
-        front = candidate.normalized_form
-        back_html = (
-            f"{html.escape(english_translation)}"
-            f"<br><br>{html.escape(prompt_input.example_sentence.sentence_text)}"
-            f"<br>{html.escape(example_sentence_translation)}"
-        )
-
-    return CardResultRow(
-        reviewed_lexeme_id=candidate.reviewed_lexeme_id,
-        normalized_form=candidate.normalized_form,
-        word_class=candidate.word_class.value,
-        source_lemma=candidate.source_lemma,
-        original_forms=list(candidate.original_forms),
-        occurrence_count=candidate.occurrence_count,
-        example_sentence=prompt_input.example_sentence,
-        english_translation=english_translation,
-        example_sentence_translation=example_sentence_translation,
-        front=front,
-        back_html=back_html,
-        cache=cache_info,
-    )
-
-
-def write_anki_tsv(results: list[CardResultRow], output_path: Path) -> None:
+def write_anki_tsv(rows: list[CardRow], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
-        for row in results:
-            if row.cache["status"] != "completed" or row.front is None or row.back_html is None:
-                continue
-            front = row.front.replace("\t", " ").replace("\n", " ").strip()
-            back_html = row.back_html.replace("\t", " ").replace("\n", " ").strip()
-            handle.write(f"{front}\t{back_html}\n")
+        for row in rows:
+            values = [
+                row.word,
+                row.part_of_speech,
+                row.meaning,
+                row.example_sentence,
+                row.sentence_translation,
+            ]
+            cleaned = [value.replace("\t", " ").replace("\n", " ").strip() for value in values]
+            handle.write("\t".join(cleaned) + "\n")
 
 
 def build_genanki_model() -> Any:
@@ -170,158 +119,264 @@ def build_genanki_model() -> Any:
         ANKI_MODEL_ID,
         "Greek Lemma Card",
         fields=[
-            {"name": "Front"},
-            {"name": "Back"},
+            {"name": "Word"},
+            {"name": "PartOfSpeech"},
+            {"name": "Meaning"},
+            {"name": "ExampleSentence"},
+            {"name": "SentenceTranslation"},
         ],
         templates=[
             {
                 "name": "Card 1",
-                "qfmt": "{{Front}}",
-                "afmt": "{{FrontSide}}<hr id=\"answer\">{{Back}}",
+                "qfmt": """
+<div class="customCard">
+  <div class="targetWordContainerFront">
+    <div class="targetWord">{{Word}}</div>
+  </div>
+</div>
+""",
+                "afmt": """
+<div class="customCard cardBack">
+  <div class="targetWordContainerBack borderBottom">
+    <span class="targetWord">{{Word}}</span>
+    {{#PartOfSpeech}}<span class="partOfSpeech">{{PartOfSpeech}}</span>{{/PartOfSpeech}}
+  </div>
+
+  <div class="section borderBottom">
+    <div class="header">Meaning:</div>
+    <div class="indent">
+      <div class="definitionsText">{{Meaning}}</div>
+    </div>
+  </div>
+
+  <div class="section borderBottom">
+    <div class="header">Example sentence:</div>
+    <div class="indent">
+      <div class="exampleSentenceWrapper">
+        <span class="exampleSentence">{{ExampleSentence}}</span>
+      </div>
+      <div class="sentenceTranslation">{{hint:SentenceTranslation}}</div>
+    </div>
+  </div>
+</div>
+""",
             }
         ],
+        css="""
+:root {
+  --max-width-card: 400px;
+  --font-size-card: 18px;
+  --font-size-targetWord: 26px;
+  --font-size-header: 16px;
+
+  --color-text-primary: #18191f;
+  --color-nightMode-text-primary: #fbfafe;
+  --color-card-background: #ffffff;
+  --color-nightMode-card-background: #0b0716;
+  --color-box-shadow: rgba(18, 62, 119, 0.1);
+  --color-audio-button: #8369ed;
+  --color-hint: #6b7280;
+  --color-nightMode-hint: #9ca3af;
+  --color-sentence-translation: #6b7280;
+  --color-nightMode-sentence-translation: #9ca3af;
+  --color-header: #9ca3af;
+  --color-nightMode-header: rgba(255, 255, 255, 0.5);
+  --color-divider: #e5e7eb;
+  --color-nightMode-divider: #1f2937;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0 !important;
+  overflow-wrap: break-word;
+}
+
+.card {
+  padding: 16px;
+}
+
+.customCard {
+  margin: 0 auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  background-color: var(--color-card-background);
+  box-shadow: 1px 3px 10px var(--color-box-shadow);
+  border-radius: 8px;
+  min-height: 200px;
+  max-width: var(--max-width-card);
+  font-weight: 400;
+  font-size: var(--font-size-card);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--color-text-primary);
+}
+
+.nightMode .customCard {
+  color: var(--color-nightMode-text-primary);
+  background-color: var(--color-nightMode-card-background);
+}
+
+.cardBack {
+  justify-content: flex-start;
+}
+
+.targetWord {
+  font-size: var(--font-size-targetWord);
+  font-weight: 600;
+}
+
+.targetWordContainerFront {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 32px 16px;
+}
+
+.targetWordContainerBack {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  align-self: stretch;
+  padding: 32px 16px 24px 16px;
+  gap: 12px;
+}
+
+.partOfSpeech {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--color-hint);
+  font-style: italic;
+}
+
+.nightMode .partOfSpeech {
+  color: var(--color-nightMode-hint);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  gap: 6px;
+  padding: 12px 16px 16px 16px;
+}
+
+.borderBottom {
+  border-bottom: 1px solid var(--color-divider);
+}
+
+.nightMode .borderBottom {
+  border-color: var(--color-nightMode-divider);
+}
+
+.header {
+  color: var(--color-header);
+  font-size: var(--font-size-header);
+  font-weight: 400;
+}
+
+.nightMode .header {
+  color: var(--color-nightMode-header);
+}
+
+.exampleSentenceWrapper {
+  display: flex;
+  align-items: center;
+  position: relative;
+  gap: 5px;
+}
+
+.exampleSentence {
+  color: var(--color-hint);
+}
+
+.nightMode .exampleSentence {
+  color: var(--color-nightMode-hint);
+}
+
+.sentenceTranslation {
+  color: var(--color-sentence-translation);
+  font-weight: 400;
+  font-style: italic;
+  padding-top: 6px;
+  padding-left: 4px;
+}
+
+.nightMode .sentenceTranslation {
+  color: var(--color-nightMode-sentence-translation);
+}
+
+.definitionsText {
+  line-height: 1.5;
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.nightMode .definitionsText {
+  color: var(--color-nightMode-text-primary);
+}
+
+.indent {
+  padding-left: 12px;
+}
+""",
     )
 
 
-def write_anki_package(results: list[CardResultRow], output_path: Path, deck_name: str) -> None:
+def write_anki_package(rows: list[CardRow], output_path: Path, deck_name: str) -> None:
     import genanki
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    deck = genanki.Deck(1387426501, deck_name)
+    deck = genanki.Deck(ANKI_MODEL_ID, deck_name)
     model = build_genanki_model()
 
-    for row in results:
-        if row.cache["status"] != "completed" or row.front is None or row.back_html is None:
-            continue
-
+    for due_position, row in enumerate(rows, start=1):
         note = genanki.Note(
             model=model,
-            fields=[row.front, row.back_html],
-            guid=genanki.guid_for(f"{row.reviewed_lexeme_id}:{row.front}"),
+            fields=[
+                row.word,
+                row.part_of_speech,
+                row.meaning,
+                row.example_sentence,
+                row.sentence_translation,
+            ],
+            guid=genanki.guid_for(f"{row.normalized_lexeme_id}:{row.word}"),
+            due=due_position,
         )
         deck.add_note(note)
 
     genanki.Package(deck).write_to_file(output_path)
 
 
-async def translate_candidate(
-    *,
-    client: AsyncOpenAI | None,
-    cache: PromptCacheStore,
-    model: str,
-    candidate: TranslationCandidate,
-    thinking: bool,
-) -> CardResultRow:
-    prompt_input = build_translation_input(candidate)
-    translation, cache_info = await run_cached_structured_completion(
-        client=client,
-        cache=cache,
-        model=model,
-        system_prompt=SYSTEM_PROMPT,
-        user_prompt=json.dumps(prompt_input.model_dump(mode="json"), ensure_ascii=False),
-        input_payload=prompt_input.model_dump(mode="json"),
-        response_model=TranslationResponse,
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS,
-        reasoning_effort=REASONING_EFFORT,
-        max_retries=MAX_RETRIES,
-        thinking=thinking,
-    )
-    if translation is not None and not isinstance(translation, TranslationResponse):
-        raise RuntimeError("Translation response did not match the expected response model.")
-    return build_card_result(candidate, prompt_input, translation, cache_info)
-
-
-async def run_card_creation(
-    *,
-    db_path: Path,
-    output_jsonl_path: Path,
-    output_tsv_path: Path | None,
-    output_apkg_path: Path | None,
-    deck_name: str,
-    base_url: str,
-    api_key: str,
-    model_name: str | None,
-    concurrency: int,
-    thinking: bool,
-    write_tsv: bool,
-    write_apkg: bool,
-    limit: int | None,
-) -> tuple[str, list[CardResultRow]]:
-    candidates = load_translation_candidates(db_path)
-    if limit is not None:
-        candidates = candidates[:limit]
-
-    cache = PromptCacheStore(db_path)
-    await cache.open()
-    client: AsyncOpenAI | None = None
-    if base_url and api_key:
-        client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-
-    if client is None:
-        model = model_name or DEFAULT_MODEL
-    else:
-        model = await pick_model(client, model_name)
-
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def worker(candidate: TranslationCandidate) -> CardResultRow:
-        async with semaphore:
-            return await translate_candidate(
-                client=client,
-                cache=cache,
-                model=model,
-                candidate=candidate,
-                thinking=thinking,
-            )
-
-    try:
-        results = await asyncio.gather(*(worker(candidate) for candidate in candidates))
-    finally:
-        if client is not None:
-            await client.close()
-        await cache.close()
-
-    write_jsonl([row.model_dump(mode="json") for row in results], output_jsonl_path)
-    if write_tsv:
-        if output_tsv_path is None:
-            raise RuntimeError("TSV output requested but no --output-tsv path was provided.")
-        write_anki_tsv(results, output_tsv_path)
-    if write_apkg:
-        if output_apkg_path is None:
-            raise RuntimeError("APKG output requested but no --output-apkg path was provided.")
-        write_anki_package(results, output_apkg_path, deck_name)
-    return model, results
-
-
 @app.command()
 def main(
-    db_path: Path = typer.Option(
-        DEFAULT_DB_PATH,
-        "--db",
+    input_path: Path = typer.Option(
+        DEFAULT_INPUT_PATH,
+        "--input",
         exists=True,
         file_okay=True,
         dir_okay=False,
         readable=True,
-        help="Path to the subs2anki SQLite database.",
+        help="Path to translation-pass JSONL output.",
     ),
-    output_jsonl_path: Path = typer.Option(
-        DEFAULT_OUTPUT_JSONL_PATH,
-        "--output-jsonl",
-        file_okay=True,
-        dir_okay=False,
-        writable=True,
-        help="Path to save the detailed card creation JSONL output.",
-    ),
-    output_tsv_path: Path | None = typer.Option(
+    output_tsv_path: Path = typer.Option(
         DEFAULT_OUTPUT_TSV_PATH,
         "--output-tsv",
         file_okay=True,
         dir_okay=False,
         writable=True,
-        help="Path to save a two-column Anki import TSV.",
+        help="Path to save an Anki import TSV.",
     ),
-    output_apkg_path: Path | None = typer.Option(
+    output_apkg_path: Path = typer.Option(
         DEFAULT_OUTPUT_APKG_PATH,
         "--output-apkg",
         file_okay=True,
@@ -334,90 +389,33 @@ def main(
         "--deck-name",
         help="Deck name to use for the generated .apkg file.",
     ),
-    concurrency: int = typer.Option(
-        10,
-        "--concurrency",
-        min=1,
-        help="Maximum number of concurrent model requests.",
-    ),
     limit: int | None = typer.Option(
         None,
         "--limit",
         min=1,
-        help="Optional limit on the number of reviewed lexemes to translate.",
+        help="Optional limit on the number of cards to export.",
     ),
-    base_url: str = typer.Option(
-        DEFAULT_BASE_URL or "",
-        "--base-url",
-        help="OpenAI-compatible base URL.",
-        show_default=False,
-    ),
-    token: str = typer.Option(
-        DEFAULT_TOKEN or "",
-        "--token",
-        help="API token for the OpenAI-compatible endpoint.",
-        show_default=False,
-    ),
-    model: str | None = typer.Option(
-        DEFAULT_MODEL,
-        "--model",
-        help="Model name. If omitted, the first model from /v1/models is used.",
-    ),
-    thinking: bool = typer.Option(
+    exclude_proper_nouns: bool = typer.Option(
         False,
-        "--thinking/--no-thinking",
-        help="Enable or disable model thinking mode.",
-    ),
-    write_tsv: bool = typer.Option(
-        False,
-        "--write-tsv/--no-write-tsv",
-        help="Write the TSV artifact.",
-    ),
-    write_apkg: bool = typer.Option(
-        False,
-        "--write-apkg/--no-write-apkg",
-        help="Write the APKG artifact.",
+        "--exclude-proper-nouns/--include-proper-nouns",
+        help="Exclude rows tagged as proper_noun from the exported cards.",
     ),
 ) -> None:
-    if (base_url and not token) or (token and not base_url):
-        typer.echo(
-            "Provide both --base-url and --token, or neither to run against the existing cache only.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    rows = [row for row in load_jsonl(input_path, TranslationPassRow) if isinstance(row, TranslationPassRow)]
+    rows = filter_rows(rows, exclude_proper_nouns=exclude_proper_nouns)
+    cards = build_card_rows(rows, limit)
+    write_anki_tsv(cards, output_tsv_path)
+    write_anki_package(cards, output_apkg_path, deck_name)
 
-    try:
-        resolved_model, results = asyncio.run(
-            run_card_creation(
-                db_path=db_path,
-                output_jsonl_path=output_jsonl_path,
-                output_tsv_path=output_tsv_path,
-                output_apkg_path=output_apkg_path,
-                deck_name=deck_name,
-                base_url=base_url,
-                api_key=token,
-                model_name=model,
-                concurrency=concurrency,
-                thinking=thinking,
-                write_tsv=write_tsv,
-                write_apkg=write_apkg,
-                limit=limit,
-            )
-        )
-    except RuntimeError as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(code=1) from exc
-
-    typer.echo(f"model={resolved_model}")
-    typer.echo(f"db={db_path}")
-    typer.echo(f"output_jsonl={output_jsonl_path}")
-    typer.echo(f"output_tsv={output_tsv_path if write_tsv else 'disabled'}")
-    typer.echo(f"output_apkg={output_apkg_path if write_apkg else 'disabled'}")
-    typer.echo("cache_db=same as --db")
-    typer.echo(f"candidate_count={len(results)}")
-    typer.echo(f"completed={sum(1 for row in results if row.cache['status'] == 'completed')}")
-    typer.echo(f"failed={sum(1 for row in results if row.cache['status'] == 'failed')}")
-    typer.echo(f"cache_hits={sum(1 for row in results if row.cache['cache_hit'])}")
+    typer.echo(f"input={input_path}")
+    typer.echo(f"output_tsv={output_tsv_path}")
+    typer.echo(f"output_apkg={output_apkg_path}")
+    typer.echo(f"exclude_proper_nouns={exclude_proper_nouns}")
+    typer.echo(f"card_count={len(cards)}")
+    if cards:
+        typer.echo(f"sample_word={cards[0].word}")
+        typer.echo(f"sample_meaning={cards[0].meaning}")
+        typer.echo(f"sample_example_sentence={cards[0].example_sentence}")
 
 
 if __name__ == "__main__":

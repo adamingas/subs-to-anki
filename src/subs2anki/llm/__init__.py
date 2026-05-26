@@ -1,4 +1,9 @@
-from subs2anki.llm.cache import PromptCacheStore, pick_model, run_cached_structured_completion
+from subs2anki.llm.cache import (
+    PromptCacheStore,
+    import_prompt_cache_entries,
+    pick_model,
+    run_cached_structured_completion,
+)
 from subs2anki.llm.types import (
     CachedResult,
     LemmaCandidate,
@@ -22,6 +27,7 @@ __all__ = [
     "LexemeGroup",
     "LexemeResolutionResponse",
     "PromptCacheStore",
+    "import_prompt_cache_entries",
     "PronounGroup",
     "PronounKind",
     "PronounResolutionResponse",

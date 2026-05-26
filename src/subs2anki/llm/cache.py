@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -17,6 +18,26 @@ from subs2anki.db.core import create_cache_schema, create_engine_for_path, resol
 from subs2anki.llm.types import CachedResult
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+PROMPT_CACHE_COLUMNS = (
+    "cache_key",
+    "model",
+    "system_prompt_hash",
+    "user_prompt_hash",
+    "parameters_hash",
+    "schema_hash",
+    "system_prompt",
+    "user_prompt",
+    "parameters_json",
+    "input_json",
+    "status",
+    "response_json",
+    "reasoning_content",
+    "elapsed_ms",
+    "error_text",
+    "created_at",
+    "updated_at",
+)
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -44,6 +65,55 @@ def extract_reasoning(message: object) -> str | None:
             return json.dumps(value, ensure_ascii=False)
 
     return None
+
+
+def import_prompt_cache_entries(source_path: Path, target_path: Path) -> int:
+    resolved_source = resolve_db_path(source_path)
+    resolved_target = resolve_db_path(target_path)
+    if resolved_source == resolved_target or not resolved_source.exists():
+        return 0
+
+    engine = create_engine_for_path(resolved_target)
+    try:
+        create_cache_schema(engine)
+    finally:
+        engine.dispose()
+
+    target_columns = ", ".join(PROMPT_CACHE_COLUMNS)
+    source_columns = ", ".join(PROMPT_CACHE_COLUMNS)
+
+    with sqlite3.connect(resolved_target) as connection:
+        connection.execute("ATTACH DATABASE ? AS source_cache", (str(resolved_source),))
+        source_table_info = connection.execute(
+            "PRAGMA source_cache.table_info(prompt_cache)"
+        ).fetchall()
+        source_column_names = {row[1] for row in source_table_info}
+        if "prompt_cache" not in {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM source_cache.sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }:
+            connection.execute("DETACH DATABASE source_cache")
+            return 0
+
+        if "schema_hash" not in source_column_names:
+            source_columns = ", ".join(
+                "''" if column == "schema_hash" else column for column in PROMPT_CACHE_COLUMNS
+            )
+
+        before_changes = connection.total_changes
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO prompt_cache ({target_columns})
+            SELECT {source_columns}
+            FROM source_cache.prompt_cache
+            """
+        )
+        inserted = connection.total_changes - before_changes
+        connection.commit()
+        connection.execute("DETACH DATABASE source_cache")
+        return inserted
 
 
 async def pick_model(client: AsyncOpenAI, requested_model: str | None) -> str:
@@ -123,6 +193,7 @@ class PromptCacheStore:
         self._connection.row_factory = aiosqlite.Row
         await self._connection.execute("PRAGMA journal_mode=WAL")
         await self._connection.execute("PRAGMA synchronous=NORMAL")
+        await self._connection.execute("PRAGMA busy_timeout=5000")
         await self._ensure_schema_hash_column()
         await self._connection.execute(
             """
