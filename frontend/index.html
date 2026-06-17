@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Subs2Anki Subtitle Finder</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Stremio catalogue + public subtitle addons</p>
+        <h1>Find a film or episode. Pull a subtitle. Start studying.</h1>
+        <p class="intro">
+          Search movies and series through Cinemeta, then download matching subtitle files from token-free
+          Stremio subtitle addons.
+        </p>
+
+        <form id="search-form" class="search-panel" autocomplete="off">
+          <label for="search-input">Title search</label>
+          <div class="search-row">
+            <input id="search-input" type="search" placeholder="Try Breaking Bad, The Matrix, Dark..." autofocus>
+            <button type="submit">Search</button>
+          </div>
+          <div id="suggestions" class="suggestions" hidden></div>
+        </form>
+      </section>
+
+      <section class="toolbar">
+        <div>
+          <p class="label">Results</p>
+          <h2 id="results-heading">Search to begin</h2>
+        </div>
+        <label class="language-filter">
+          Subtitle language
+          <select id="language-filter">
+            <option value="all">All languages</option>
+          </select>
+        </label>
+      </section>
+
+      <section id="results" class="grid empty">
+        <p>Type a title and press Enter to load matching movies and series.</p>
+      </section>
+
+      <section id="detail" class="detail" hidden></section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
